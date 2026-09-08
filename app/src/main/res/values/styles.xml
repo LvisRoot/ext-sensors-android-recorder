@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.ExtSensors" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#00A896</item>
+        <item name="android:navigationBarColor">#101416</item>
+        <item name="android:statusBarColor">#101416</item>
+    </style>
+</resources>
