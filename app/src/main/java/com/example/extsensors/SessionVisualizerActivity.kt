@@ -1,6 +1,7 @@
 package com.example.extsensors
 
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.graphics.SurfaceTexture
 import android.graphics.drawable.GradientDrawable
@@ -55,6 +56,8 @@ class SessionVisualizerActivity : ComponentActivity() {
     private var pendingVideoUri: Uri? = null
     private var pendingSurfaceTexture: SurfaceTexture? = null
     private var videoDurationMs = 0
+    private var windowStartMs = 0
+    private var windowEndMs = 0
     private var isUserSeeking = false
     private var loadedSeries: Map<String, List<Pair<Float, Float>>> = emptyMap()
     private var loadedColors: Map<String, Int> = emptyMap()
@@ -175,6 +178,9 @@ class SessionVisualizerActivity : ComponentActivity() {
         val bottomSpacer = View(this)
         graphView = GraphOverlayView(this).apply {
             setBackgroundColor(Color.argb(DEFAULT_GRAPH_ALPHA, 0, 0, 0))
+            onTimeWindowChanged = { startSeconds, endSeconds ->
+                applyTimeWindow((startSeconds * 1000).toInt(), (endSeconds * 1000).toInt())
+            }
         }
         overlayContainer.addView(graphView, LinearLayout.LayoutParams(-1, 0, 1f))
         overlayContainer.addView(bottomSpacer, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -223,15 +229,20 @@ class SessionVisualizerActivity : ComponentActivity() {
             text = "Play"
             setOnClickListener { togglePlayback() }
         }
+        val homeScaleButton = Button(this).apply {
+            text = "Home"
+            setOnClickListener { graphView.resetTimeWindow() }
+        }
         timeLabel = TextView(this).apply { setTextColor(Color.WHITE); setPadding(16, 0, 16, 0) }
         transportRow.addView(backButton)
         transportRow.addView(playPauseButton)
+        transportRow.addView(homeScaleButton)
         transportRow.addView(timeLabel)
         controls.addView(transportRow)
         seekBar = SeekBar(this).apply {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
-                    if (fromUser) mediaPlayer?.seekTo(progress)
+                    if (fromUser) mediaPlayer?.seekTo(windowStartMs + progress)
                 }
                 override fun onStartTrackingTouch(seekBar: SeekBar) { isUserSeeking = true }
                 override fun onStopTrackingTouch(seekBar: SeekBar) { isUserSeeking = false }
@@ -368,9 +379,11 @@ class SessionVisualizerActivity : ComponentActivity() {
     private fun loadVideoAndSignals(dir: DocumentFile) {
         lifecycleScope.launch(Dispatchers.IO) {
             val paramsFile = dir.listFiles().firstOrNull { it.name == "params.json" }
-            val startMs = paramsFile?.let { readText(it.uri) }?.let {
-                try { JSONObject(it).optLong("video_start_unix_ms", 0L) } catch (_: Exception) { 0L }
-            } ?: 0L
+            val params = paramsFile?.let { readText(it.uri) }?.let {
+                try { JSONObject(it) } catch (_: Exception) { null }
+            }
+            val startMs = params?.optLong("video_start_unix_ms", 0L) ?: 0L
+            val recordedOrientation = params?.optJSONObject("camera")?.optString("orientation_at_start")
             val series = mutableMapOf<String, MutableList<Pair<Float, Float>>>()
             val units = mutableMapOf<String, String>()
             dir.listFiles().filter { it.name?.endsWith(".csv") == true }.forEach { csvFile ->
@@ -399,6 +412,11 @@ class SessionVisualizerActivity : ComponentActivity() {
                 loadedUnits = units
                 buildLegend(series.keys.sorted(), units, colors)
                 loadingOverlay.visibility = View.GONE
+                requestedOrientation = when (recordedOrientation) {
+                    "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                    "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                }
                 pendingVideoUri = videoFile?.uri
                 if (textureView.isAvailable) pendingVideoUri?.let { startPlayback(it) }
             }
@@ -439,7 +457,9 @@ class SessionVisualizerActivity : ComponentActivity() {
                 setSurface(Surface(surfaceTexture))
                 setOnPreparedListener { player ->
                     videoDurationMs = player.duration
-                    seekBar.max = videoDurationMs
+                    windowStartMs = 0
+                    windowEndMs = videoDurationMs
+                    seekBar.max = videoDurationMs.coerceAtLeast(1)
                     graphView.setSeries(loadedSeries, loadedColors, loadedUnits, videoDurationMs / 1000f)
                     player.start()
                     playPauseButton.text = "Pause"
@@ -464,10 +484,29 @@ class SessionVisualizerActivity : ComponentActivity() {
 
     private fun updateProgressUi() {
         val player = mediaPlayer ?: return
-        val position = try { player.currentPosition } catch (_: Exception) { return }
-        if (!isUserSeeking) seekBar.progress = position
+        var position = try { player.currentPosition } catch (_: Exception) { return }
+        if (position !in windowStartMs..windowEndMs) {
+            position = windowStartMs
+            player.seekTo(position)
+        }
+        if (!isUserSeeking) seekBar.progress = (position - windowStartMs).coerceIn(0, seekBar.max)
         timeLabel.text = "${formatDuration(position.toLong())} / ${formatDuration(videoDurationMs.toLong())}"
-        if (videoDurationMs > 0) graphView.setProgressFraction(position.toFloat() / videoDurationMs)
+        if (videoDurationMs > 0) graphView.setProgressSeconds(position / 1000f)
+    }
+
+    private fun applyTimeWindow(startMs: Int, endMs: Int) {
+        if (videoDurationMs <= 0) return
+        windowStartMs = startMs.coerceIn(0, videoDurationMs)
+        windowEndMs = endMs.coerceIn(windowStartMs + 1, videoDurationMs)
+        seekBar.max = (windowEndMs - windowStartMs).coerceAtLeast(1)
+        val player = mediaPlayer ?: return
+        val position = try { player.currentPosition } catch (_: Exception) { return }
+        if (position !in windowStartMs..windowEndMs) {
+            player.seekTo(windowStartMs)
+            if (!isUserSeeking) seekBar.progress = 0
+        } else if (!isUserSeeking) {
+            seekBar.progress = (position - windowStartMs).coerceIn(0, seekBar.max)
+        }
     }
 
     private fun releasePlayer() {
