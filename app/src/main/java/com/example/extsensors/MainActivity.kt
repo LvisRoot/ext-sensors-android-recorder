@@ -3,20 +3,23 @@ package com.example.extsensors
 import android.Manifest
 import android.app.AlertDialog
 import android.bluetooth.BluetoothDevice
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.hardware.camera2.CaptureRequest
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
-import android.util.Range
 import android.view.Gravity
 import android.view.View
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -29,18 +32,8 @@ import android.widget.Spinner
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.camera2.interop.Camera2Interop
-import androidx.camera.core.Camera
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.FileDescriptorOutputOptions
-import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
-import androidx.camera.video.Recorder
-import androidx.camera.video.Recording
-import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -55,13 +48,17 @@ class MainActivity : ComponentActivity() {
     private lateinit var sessionPrefixLabel: TextView
     private lateinit var sensorsButton: Button
     private lateinit var folderButton: Button
+    private lateinit var qualityButton: Button
+    private lateinit var modeButton: Button
     private lateinit var recordButton: Button
     private lateinit var recordingDot: View
+    private lateinit var lockOverlay: TextView
     private lateinit var sensorPanel: View
     private lateinit var recorder: SessionRecorder
-    private var videoCapture: VideoCapture<Recorder>? = null
-    private var camera: Camera? = null
-    private var recording: Recording? = null
+    private var recordingService: RecordingService? = null
+    private var selectedQuality: Quality = Quality.LOWEST
+    private var keepLivePreview = false
+    private var recording = false
     private var scanner: BleSensorScanner? = null
     private var sessionPrefix = ""
     private val connections = mutableMapOf<SensorKind, BleSensorConnection>()
@@ -79,10 +76,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // The camera + recording live in a foreground Service so Android's background camera-access
+    // restriction (which stalls a backgrounded app's camera after a few seconds) doesn't apply.
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder) {
+            recordingService = (service as RecordingService.LocalBinder).service
+            recordingService?.startCamera(previewView.surfaceProvider) { runOnUiThread { updateOverlay() } }
+        }
+        override fun onServiceDisconnected(name: ComponentName?) { recordingService = null }
+    }
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        if (permissions[Manifest.permission.CAMERA] == true) startCamera()
+        if (permissions[Manifest.permission.CAMERA] == true) bindRecordingService()
         if (permissions[Manifest.permission.BLUETOOTH_SCAN] == true) scanSensors()
     }
 
@@ -96,6 +103,10 @@ class MainActivity : ComponentActivity() {
         buildUi()
         restoreStorageFolder()
         permissionLauncher.launch(requiredPermissions())
+    }
+
+    private fun bindRecordingService() {
+        bindService(Intent(this, RecordingService::class.java), serviceConnection, Context.BIND_AUTO_CREATE)
     }
 
     private fun restoreStorageFolder() {
@@ -128,6 +139,13 @@ class MainActivity : ComponentActivity() {
             setPadding(20, 14, 20, 14)
         }
         root.addView(activeOverlay, frameParams(Gravity.TOP or Gravity.START))
+        lockOverlay = text("Recording in progress, you can lock the phone", 18).apply {
+            setTextColor(Color.WHITE)
+            setBackgroundColor(0xCC101416.toInt())
+            setPadding(32, 20, 32, 20)
+            visibility = View.GONE
+        }
+        root.addView(lockOverlay, frameParams(Gravity.CENTER))
         storageLabel = text("Saving to: ${recorder.storageDescription()}", 13).apply {
             setTextColor(Color.WHITE)
             setBackgroundColor(0xAA101416.toInt())
@@ -146,7 +164,8 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showPrefixDialog() }
         }
         controls.addView(sessionPrefixLabel, LinearLayout.LayoutParams(-1, -2))
-        val buttonsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val topRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val bottomRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         sensorsButton = Button(this).apply {
             text = "Sensors"
             setOnClickListener { sensorPanel.visibility = View.VISIBLE; scanSensors() }
@@ -154,6 +173,17 @@ class MainActivity : ComponentActivity() {
         folderButton = Button(this).apply {
             text = "Folder"
             setOnClickListener { folderLauncher.launch(null) }
+        }
+        qualityButton = Button(this).apply {
+            text = "\uD83D\uDCD0 ${qualityLabel(selectedQuality)}"
+            setOnClickListener { showQualityDialog() }
+        }
+        modeButton = Button(this).apply {
+            text = recordingModeLabel()
+            setOnClickListener {
+                keepLivePreview = !keepLivePreview
+                text = recordingModeLabel()
+            }
         }
         recordButton = Button(this).apply {
             text = "Start recording"
@@ -164,11 +194,22 @@ class MainActivity : ComponentActivity() {
             background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.RED) }
             visibility = View.INVISIBLE
         }
-        buttonsRow.addView(sensorsButton, LinearLayout.LayoutParams(0, -2, 1f))
-        buttonsRow.addView(folderButton, LinearLayout.LayoutParams(0, -2, 1f))
-        buttonsRow.addView(recordButton, LinearLayout.LayoutParams(0, -2, 1f))
-        buttonsRow.addView(recordingDot, LinearLayout.LayoutParams(24, 24).apply { marginStart = 12 })
-        controls.addView(buttonsRow)
+        topRow.addView(sensorsButton, LinearLayout.LayoutParams(0, -2, 1f))
+        topRow.addView(folderButton, LinearLayout.LayoutParams(0, -2, 1f))
+        topRow.addView(modeButton, LinearLayout.LayoutParams(0, -2, 1f))
+        bottomRow.addView(qualityButton, LinearLayout.LayoutParams(0, -2, 1f))
+        bottomRow.addView(recordButton, LinearLayout.LayoutParams(0, -2, 1f))
+        bottomRow.addView(recordingDot, LinearLayout.LayoutParams(24, 24).apply { marginStart = 12 })
+        controls.addView(topRow)
+        controls.addView(bottomRow)
+        controls.addView(Button(this).apply {
+            text = "\uD83D\uDCCA Session visualizer"
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, SessionVisualizerActivity::class.java).apply {
+                    putExtra(SessionVisualizerActivity.EXTRA_FOLDER_URI, recorder.storageTreeUri?.toString())
+                })
+            }
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = 8 })
         root.addView(controls, frameParams(Gravity.BOTTOM))
 
         sensorPanel = buildSensorPanel()
@@ -367,7 +408,7 @@ class MainActivity : ComponentActivity() {
     private fun updateOverlay() {
         activeOverlay.text = if (selectedSignals.isEmpty()) "No active sensors" else
             selectedSignals.keys.joinToString("\n") { "${it.kind.title}: ${it.signal}" }
-        recordButton.isEnabled = videoCapture != null && selectedSignals.isNotEmpty()
+        recordButton.isEnabled = recordingService != null && selectedSignals.isNotEmpty()
     }
 
     private fun requiredPermissions(): Array<String> = buildList {
@@ -377,68 +418,84 @@ class MainActivity : ComponentActivity() {
             add(Manifest.permission.BLUETOOTH_SCAN)
             add(Manifest.permission.BLUETOOTH_CONNECT)
         }
+        if (android.os.Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
     }.toTypedArray()
 
-    private fun startCamera() {
-        val future = ProcessCameraProvider.getInstance(this)
-        future.addListener({
-            val provider = future.get()
-            val previewBuilder = Preview.Builder()
-            Camera2Interop.Extender(previewBuilder).setCaptureRequestOption(
-                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(TARGET_FPS, TARGET_FPS)
-            )
-            val preview = previewBuilder.build().also { it.surfaceProvider = previewView.surfaceProvider }
-            val cameraRecorder = Recorder.Builder().setQualitySelector(QualitySelector.from(Quality.HIGHEST)).build()
-            videoCapture = VideoCapture.withOutput(cameraRecorder)
-            provider.unbindAll()
-            camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, videoCapture)
-            updateOverlay()
-        }, ContextCompat.getMainExecutor(this))
+    private fun showQualityDialog() {
+        val labels = QUALITIES.map { it.second }.toTypedArray()
+        val currentIndex = QUALITIES.indexOfFirst { it.first == selectedQuality }.coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle("\uD83D\uDCD0 Camera quality")
+            .setSingleChoiceItems(labels, currentIndex) { dialog, which ->
+                selectedQuality = QUALITIES[which].first
+                qualityButton.text = "\uD83D\uDCD0 ${QUALITIES[which].second}"
+                recordingService?.setQuality(selectedQuality, previewView.surfaceProvider)
+                dialog.dismiss()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
+    private fun qualityLabel(quality: Quality): String = QUALITIES.first { it.first == quality }.second
+
+    private fun recordingModeLabel() = if (keepLivePreview) "\uD83D\uDC41 Live preview" else "\uD83D\uDD12 Record while locked"
+
     private fun toggleRecording() {
-        if (recording != null) {
-            recording?.stop()
-            recording = null
+        val service = recordingService ?: return
+        if (recording) {
+            service.stopRecording()
             recorder.finish()
+            recording = false
             recordButton.text = "Start recording"
             blinkHandler.removeCallbacks(blinkRunnable)
             recordingDot.visibility = View.INVISIBLE
+            lockOverlay.visibility = View.GONE
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             sensorsButton.isEnabled = true
             folderButton.isEnabled = true
+            qualityButton.isEnabled = true
+            modeButton.isEnabled = true
             return
         }
-        val output = videoCapture ?: return
         val listener = { event: VideoRecordEvent ->
             if (event is VideoRecordEvent.Finalize && event.hasError()) status.text = "Video error: ${event.error}"
             Unit
         }
-        val executor = ContextCompat.getMainExecutor(this)
-        recording = when (val target = recorder.begin(sessionPrefix, buildCameraParamsJson(), buildSensorParamsJson())) {
-            is SessionOutput.PlainFile -> output.output
-                .prepareRecording(this, FileOutputOptions.Builder(target.videoFile).build())
-                .withAudioEnabled().start(executor, listener)
-            is SessionOutput.Document -> output.output
-                .prepareRecording(this, FileDescriptorOutputOptions.Builder(target.videoDescriptor).build())
-                .withAudioEnabled().start(executor, listener)
+        val target = recorder.begin(sessionPrefix, buildCameraParamsJson(), buildSensorParamsJson())
+        // Promote the service to foreground before it opens the recording surface, matching the
+        // camera/microphone foreground-service types required to keep recording through screen lock.
+        ContextCompat.startForegroundService(this, Intent(this, RecordingService::class.java))
+        if (!service.startRecording(target, keepLivePreview, listener)) {
+            recorder.finish()
+            return
         }
+        recording = true
         recordButton.text = "Stop recording"
         sensorsButton.isEnabled = false
         folderButton.isEnabled = false
+        qualityButton.isEnabled = false
+        modeButton.isEnabled = false
         blinkHandler.post(blinkRunnable)
+        if (keepLivePreview) {
+            // Live preview mode keeps the on-screen feed, so the screen must not sleep/lock on its own.
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            // Preview is dropped for lock-proof recording; tell the operator it's safe to lock up.
+            lockOverlay.visibility = View.VISIBLE
+        }
     }
 
     private fun buildCameraParamsJson(): String {
-        val info = camera?.cameraInfo
-        val resolution = info?.let { QualitySelector.getResolution(it, Quality.HIGHEST) }
+        val info = recordingService?.cameraInfo()
+        val resolution = info?.let { QualitySelector.getResolution(it, selectedQuality) }
         val orientation = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) "landscape" else "portrait"
         return "{" +
             "\"lens_facing\":\"back\"," +
-            "\"quality\":\"HIGHEST\"," +
+            "\"quality\":${jsonString(qualityLabel(selectedQuality))}," +
             "\"resolution_width\":${resolution?.width ?: -1}," +
             "\"resolution_height\":${resolution?.height ?: -1}," +
             "\"audio_enabled\":true," +
-            "\"fps_used\":$TARGET_FPS," +
+            "\"fps_used\":${RecordingService.TARGET_FPS}," +
             "\"orientation_at_start\":\"$orientation\"" +
         "}"
     }
@@ -482,9 +539,9 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         scanner?.stop()
         connections.values.forEach { it.close() }
-        recording?.stop()
         if (recorder.isRecording()) recorder.finish()
         blinkHandler.removeCallbacks(blinkRunnable)
+        if (recordingService != null) unbindService(serviceConnection)
         super.onDestroy()
     }
 
@@ -526,6 +583,13 @@ class MainActivity : ComponentActivity() {
 
     private companion object {
         const val PREF_STORAGE_URI = "storage_uri"
-        const val TARGET_FPS = 30
+        val QUALITIES = listOf(
+            Quality.UHD to "UHD (4K)",
+            Quality.FHD to "FHD (1080p)",
+            Quality.HD to "HD (720p)",
+            Quality.SD to "SD (480p)",
+            Quality.HIGHEST to "Highest (auto)",
+            Quality.LOWEST to "Lowest (auto)"
+        )
     }
 }
