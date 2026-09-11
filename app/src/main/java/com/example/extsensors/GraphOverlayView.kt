@@ -13,7 +13,6 @@ class GraphOverlayView(context: Context) : View(context) {
     private data class Series(val points: List<Pair<Float, Float>>, val color: Int, val unit: String)
 
     private val allSeries = mutableMapOf<String, Series>()
-    private val unitRange = mutableMapOf<String, Pair<Float, Float>>()
     private val visibleKeys = mutableSetOf<String>()
     private var durationSeconds = 1f
     private var progressFraction = 0f
@@ -25,16 +24,10 @@ class GraphOverlayView(context: Context) : View(context) {
         pathEffect = DashPathEffect(floatArrayOf(14f, 10f), 0f)
     }
 
-    /** Signals sharing a unit share one min/max scale, computed from all of them (not just visible ones)
-     * so toggling traces on/off never rescales an already-visible one. */
+    /** Signals sharing a unit share a min/max scale calculated from active traces. */
     fun setSeries(data: Map<String, List<Pair<Float, Float>>>, colors: Map<String, Int>, units: Map<String, String>, durationSeconds: Float) {
         allSeries.clear()
-        unitRange.clear()
         data.forEach { (key, points) -> allSeries[key] = Series(points, colors[key] ?: Color.CYAN, units[key] ?: "") }
-        allSeries.values.groupBy { it.unit }.forEach { (unit, seriesList) ->
-            val points = seriesList.flatMap { it.points }
-            if (points.isNotEmpty()) unitRange[unit] = points.minOf { it.second } to points.maxOf { it.second }
-        }
         this.durationSeconds = durationSeconds.coerceAtLeast(0.1f)
         invalidate()
     }
@@ -65,7 +58,7 @@ class GraphOverlayView(context: Context) : View(context) {
     }
 
     private fun drawUnitAxis(canvas: Canvas, unit: String, index: Int) {
-        val (minValue, maxValue) = unitRange[unit] ?: return
+        val (minValue, maxValue) = rangeForUnit(unit) ?: return
         val color = allSeries.values.firstOrNull { it.unit == unit }?.color ?: Color.WHITE
         val range = (maxValue - minValue).takeIf { it > 0.0001f } ?: 1f
         // The x axis (value = 0) is drawn for every visible unit whose range crosses zero.
@@ -83,7 +76,7 @@ class GraphOverlayView(context: Context) : View(context) {
     private fun drawSeries(canvas: Canvas, series: Series) {
         val points = series.points
         if (points.size < 2) return
-        val (minValue, maxValue) = unitRange[series.unit] ?: (points.minOf { it.second } to points.maxOf { it.second })
+        val (minValue, maxValue) = rangeForUnit(series.unit) ?: return
         val range = (maxValue - minValue).takeIf { it > 0.0001f } ?: 1f
         tracePaint.color = series.color
         val path = Path()
@@ -93,5 +86,13 @@ class GraphOverlayView(context: Context) : View(context) {
             if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
         }
         canvas.drawPath(path, tracePaint)
+    }
+
+    private fun rangeForUnit(unit: String): Pair<Float, Float>? {
+        val points = visibleKeys
+            .mapNotNull { allSeries[it] }
+            .filter { it.unit == unit }
+            .flatMap { it.points }
+        return if (points.isEmpty()) null else points.minOf { it.second } to points.maxOf { it.second }
     }
 }
